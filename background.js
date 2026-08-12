@@ -62,6 +62,7 @@ async function loadPromptSection(fileName, heading, variables = {}) {
       throw new Error(`Could not load prompt file: ${fileName}`);
     }
     markdown = await response.text();
+    markdown = markdown.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     promptFileCache.set(fileName, markdown);
   }
 
@@ -70,13 +71,15 @@ async function loadPromptSection(fileName, heading, variables = {}) {
   if (markerIndex === -1) {
     throw new Error(`Prompt section not found: ${fileName}#${heading}`);
   }
+
   const sectionStart = markerIndex + marker.length;
   const nextSection = markdown.indexOf("\n## ", sectionStart);
   const section = markdown.slice(
     sectionStart,
     nextSection === -1 ? markdown.length : nextSection,
   );
-  const fenceMatch = section.match(/```(?:[A-Za-z0-9_-]+)?\n([\s\S]*?)\n```/);
+
+  const fenceMatch = section.match(/```(?:[A-Za-z0-9_-]+)?\s*\r?\n([\s\S]*?)\r?\n```/);
   if (!fenceMatch) {
     throw new Error(`Prompt section not found: ${fileName}#${heading}`);
   }
@@ -93,26 +96,53 @@ async function requestAiCompletion({
   maxTokens,
   temperature,
   responseFormat,
+  task = "analysis",
+  modelId = null,
+  settingsOverride = null,
 }) {
-  const settings = await getSettings();
-  if (!settings.aiApiKey) {
-    const error = new Error(
-      "DeepSeek API key not configured. Open YouTube Digest Settings.",
-    );
+  const settings = settingsOverride ? YTD_SETTINGS.normalize(settingsOverride) : await getSettings();
+  const selectedModelId = modelId || settings.taskModels?.[task] || settings.defaultModel;
+  const resolved = YTD_SETTINGS.resolveModel(settings, selectedModelId);
+
+  if (!resolved.enabled) {
+    const error = new Error(`${resolved.label} is disabled. Open YouTube Digest Settings.`);
+    error.code = "AI_PROVIDER_DISABLED";
+    throw error;
+  }
+  if (!resolved.apiKey) {
+    const error = new Error(`${resolved.label} API key not configured. Open YouTube Digest Settings.`);
     error.code = "NO_AI_KEY";
     throw error;
   }
+  if (!resolved.model) {
+    const error = new Error("Custom AI model is not configured. Open YouTube Digest Settings.");
+    error.code = "NO_AI_MODEL";
+    throw error;
+  }
+
+  // OpenAI's newer reasoning models (including GPT-5 family models) use
+  // max_completion_tokens instead of the legacy max_tokens parameter.
+  // Keep provider-specific request fields isolated here so DeepSeek/custom
+  // providers retain their existing request format.
   const body = {
-    model: settings.aiModel,
-    max_tokens: maxTokens,
+    model: resolved.model,
+    [resolved.providerId === "openai" ? "max_completion_tokens" : "max_tokens"]: maxTokens,
     messages,
   };
-  if (typeof temperature === "number") body.temperature = temperature;
-  if (responseFormat) {
-    body.response_format = responseFormat;
+
+  // Gemini's current models deprecate temperature; OpenAI reasoning models also
+  // have model-specific sampling rules. Keep the legacy temperature knob only
+  // for DeepSeek/custom providers where the current endpoint accepts it.
+  if (typeof temperature === "number" && ["deepseek", "custom"].includes(resolved.providerId)) {
+    body.temperature = temperature;
   }
-  // Product features need bounded, predictable latency rather than reasoning traces.
-  body.thinking = { type: "disabled" };
+  if (responseFormat) body.response_format = responseFormat;
+
+  // DeepSeek V4 supports an explicit thinking switch. Do not leak this
+  // provider-specific field into other OpenAI-compatible providers.
+  if (resolved.providerId === "deepseek") {
+    body.thinking = { type: "disabled" };
+  }
 
   const controller = new AbortController();
   let timeoutKind = "";
@@ -125,66 +155,49 @@ async function requestAiCompletion({
   };
   const resetIdleTimeout = () => {
     clearTimeout(idleTimeoutId);
-    idleTimeoutId = setTimeout(
-      () => abortForTimeout("idle"),
-      AI_PROVIDER_IDLE_TIMEOUT_MS,
-    );
+    idleTimeoutId = setTimeout(() => abortForTimeout("idle"), AI_PROVIDER_IDLE_TIMEOUT_MS);
   };
 
-  hardTimeoutId = setTimeout(
-    () => abortForTimeout("hard"),
-    AI_PROVIDER_HARD_TIMEOUT_MS,
-  );
+  hardTimeoutId = setTimeout(() => abortForTimeout("hard"), AI_PROVIDER_HARD_TIMEOUT_MS);
   resetIdleTimeout();
   try {
-    const response = await fetch(
-      YTD_SETTINGS.chatCompletionsUrl(),
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${settings.aiApiKey}`,
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
+    const response = await fetch(YTD_SETTINGS.chatCompletionsUrl(resolved.baseUrl), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${resolved.apiKey}`,
       },
-    );
-    // Receiving headers proves DeepSeek is still making progress. DeepSeek
-    // may then send blank-line body chunks while a non-streaming request queues.
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
     resetIdleTimeout();
 
     const data = await readBoundedAiResponse(response, resetIdleTimeout);
     if (!response.ok) {
       const errorData = data && typeof data === "object" ? data : {};
       const error = new Error(
-        errorData.error?.message ||
-          errorData.message ||
-          `DeepSeek error: ${response.status}`,
+        errorData.error?.message || errorData.message || `${resolved.label} error: ${response.status}`,
       );
       error.status = response.status;
+      error.provider = resolved.providerId;
       throw error;
     }
 
     const text = data.choices?.[0]?.message?.content;
     if (typeof text !== "string" || !text.trim()) {
-      const error = new Error("DeepSeek returned an empty response.");
+      const error = new Error(`${resolved.label} returned an empty response.`);
       error.code = "EMPTY_AI_RESPONSE";
       throw error;
     }
-
-    return { text, settings };
+    return { text, settings, model: resolved };
   } catch (error) {
     if (timeoutKind === "idle") {
-      const timeoutError = new Error(
-        "DeepSeek request was inactive for 50 seconds. Please Retry.",
-      );
+      const timeoutError = new Error(`${resolved.label} request was inactive for 50 seconds. Please Retry.`);
       timeoutError.code = "AI_IDLE_TIMEOUT";
       throw timeoutError;
     }
     if (timeoutKind === "hard") {
-      const timeoutError = new Error(
-        "DeepSeek request exceeded the 120-second limit. Please Retry.",
-      );
+      const timeoutError = new Error(`${resolved.label} request exceeded the 120-second limit. Please Retry.`);
       timeoutError.code = "AI_HARD_TIMEOUT";
       throw timeoutError;
     }
@@ -318,7 +331,11 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // We need to return true to indicate we'll respond asynchronously
   if (message.action === "fetchTranscript") {
-    handleFetchTranscript(message.videoId, message.sourceLanguage)
+    handleFetchTranscript(
+      message.videoId,
+      message.sourceLanguage,
+      message.videoMetadata,
+    )
       .then(sendResponse)
       .catch((err) => sendResponse({ error: err.message }));
     return true; // Keep the message channel open for async response
@@ -393,9 +410,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.contentType,
       message.targetLanguage,
       message.videoTitle,
+      message.sourceLanguage,
     )
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "testAiProvider") {
+    testAiProvider(message.modelId, message.draftSettings)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 
@@ -508,30 +533,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             "URL:",
             tabs[0].url,
           );
-          let response = await chrome.tabs.sendMessage(
-            tabs[0].id,
-            message.payload,
-          );
 
-          // For getVideoInfo, PREFER YouTube's own player data over the
-          // DOM scrape. The player's videoDetails is canonical: its `author`
-          // is always THIS video's channel and its `shortDescription` is the
-          // full text. The DOM scrape is unreliable — e.g. on a playlist page
-          // it grabbed the playlist owner's name ("Zara Zhang") instead of the
-          // real channel ("Replit and Stripe"), and its description is
-          // truncated while the box is collapsed. We fall back to the DOM
-          // only for fields the player didn't provide.
+          // getVideoInfo is special: it must work even when an already-open
+          // YouTube tab has no live content-script receiver (for example after
+          // switching tabs or reloading the extension). The YouTube player can
+          // be queried directly from the page MAIN world, so do that first.
+          // This also makes source-language detection independent of the
+          // content-script lifecycle.
+          let playerInfo = null;
           if (message.payload?.action === "getVideoInfo") {
-            const playerInfo = await getPlayerVideoDetails(tabs[0].id);
-            if (playerInfo) {
-              response = {
-                title: playerInfo.title || response?.title || "",
-                channelName:
-                  playerInfo.channelName || response?.channelName || "",
-                duration: playerInfo.duration || response?.duration || 0,
-                description:
-                  playerInfo.description || response?.description || "",
-              };
+            playerInfo = await getPlayerVideoDetails(tabs[0].id);
+          }
+
+          let response = null;
+          if (playerInfo) {
+            response = {
+              title: playerInfo.title || "",
+              channelName: playerInfo.channelName || "",
+              duration: playerInfo.duration || 0,
+              description: playerInfo.description || "",
+              defaultAudioLanguage: playerInfo.defaultAudioLanguage || "",
+              audioLanguage: playerInfo.audioLanguage || "",
+              captionLanguages: Array.isArray(playerInfo.captionLanguages)
+                ? playerInfo.captionLanguages
+                : [],
+            };
+          } else {
+            try {
+              response = await chrome.tabs.sendMessage(
+                tabs[0].id,
+                message.payload,
+              );
+            } catch (relayError) {
+              // A freshly reloaded extension or an already-open YouTube tab may
+              // not have content.js injected yet. Recover by injecting it once
+              // and retrying the message instead of failing the whole request.
+              console.warn(
+                "[YouTube Digest BG] Content relay failed; injecting content.js and retrying:",
+                relayError.message,
+              );
+              await chrome.scripting.executeScript({
+                target: { tabId: tabs[0].id },
+                files: ["content.js"],
+              });
+              response = await chrome.tabs.sendMessage(
+                tabs[0].id,
+                message.payload,
+              );
             }
           }
 
@@ -561,32 +609,137 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
  *
  * Returns null on any failure so callers can fall back to DOM scraping.
  */
+function detectPlayerVideoLanguage(playerResponse) {
+  const details = playerResponse?.videoDetails || {};
+  const captionTracks =
+    playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+    [];
+  const nativeTrack = captionTracks.find(
+    (track) => track?.languageCode && track?.kind !== "asr",
+  );
+  const anyTrack = captionTracks.find((track) => track?.languageCode);
+  return (
+    details.defaultAudioLanguage ||
+    details.audioLanguage ||
+    nativeTrack?.languageCode ||
+    anyTrack?.languageCode ||
+    ""
+  );
+}
+
 async function getPlayerVideoDetails(tabId) {
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: () => {
+  // YouTube is an SPA and can briefly destroy/recreate the main frame while
+  // switching videos/tabs. In that window Chrome may throw "Frame with ID 0 was
+  // removed". Treat that as transient and retry before giving up.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
         try {
           const player = document.getElementById("movie_player");
-          const details = player?.getPlayerResponse?.()?.videoDetails;
+          let playerResponse = player?.getPlayerResponse?.() || null;
+
+          // On an already-loaded YouTube SPA tab, the player element can exist
+          // before getPlayerResponse() is populated (or it can be replaced during
+          // a navigation). Fall back to YouTube's page-level player response so
+          // Auto language detection does not depend on the player lifecycle.
+          if (!playerResponse) {
+            playerResponse = window.ytInitialPlayerResponse || null;
+          }
+          if (!playerResponse) {
+            const rawPlayerResponse = window.ytplayer?.config?.args?.player_response;
+            if (typeof rawPlayerResponse === "string") {
+              try {
+                playerResponse = JSON.parse(rawPlayerResponse);
+              } catch (_error) {
+                // Ignore malformed/stale player config and continue below.
+              }
+            } else if (rawPlayerResponse && typeof rawPlayerResponse === "object") {
+              playerResponse = rawPlayerResponse;
+            }
+          }
+
+          const details = playerResponse?.videoDetails;
           if (!details) return null;
+
+          // IMPORTANT: this function is serialized and executed in the page's
+          // MAIN world. It cannot see helpers from the extension's background
+          // scope, so language detection must be self-contained here.
+          const captionTracks =
+            playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+            [];
+          const nativeTracks = captionTracks.filter(
+            (track) => track?.languageCode && track?.kind !== "asr",
+          );
+          const anyTrack = captionTracks.find((track) => track?.languageCode);
+          const captionLanguages = Array.from(
+            new Set(
+              captionTracks
+                .map((track) => track?.languageCode)
+                .filter(Boolean)
+                .map((language) => String(language).replace(/_/g, "-")),
+            ),
+          );
+
+          // IMPORTANT: for this extension, a native YouTube caption track is
+          // stronger evidence of the video's source language than the
+          // defaultAudioLanguage metadata. Some videos have incorrect or
+          // generic audio metadata (for example an English channel/video can
+          // actually contain Portuguese speech and Portuguese captions).
+          //
+          // Priority:
+          //   1. native caption track (kind !== "asr")
+          //   2. any available caption track
+          //   3. YouTube audio-language metadata
+          //
+          // This prevents Auto from incorrectly locking a Portuguese video to
+          // English merely because YouTube reports defaultAudioLanguage=en.
+          const audioLanguage =
+            details.defaultAudioLanguage || details.audioLanguage || "";
+          const detectedLanguage =
+            nativeTracks[0]?.languageCode ||
+            anyTrack?.languageCode ||
+            audioLanguage ||
+            "";
+
           return {
             title: details.title || "",
             channelName: details.author || "",
             description: details.shortDescription || "",
             duration: Number(details.lengthSeconds) || 0,
+            defaultAudioLanguage: detectedLanguage,
+            audioLanguage: details.audioLanguage || "",
+            captionLanguages,
           };
         } catch (e) {
           return null;
         }
       },
-    });
-    return results?.[0]?.result || null;
-  } catch (e) {
-    console.warn("[YouTube Digest BG] Player details unavailable:", e.message);
-    return null;
+      });
+      const result = results?.[0]?.result || null;
+      if (result) {
+        debugLog(
+          "[YouTube Digest BG] Player language detected:",
+          result.defaultAudioLanguage || result.audioLanguage || "(none)",
+        );
+        return result;
+      }
+    } catch (e) {
+      const message = String(e?.message || e);
+      console.warn(
+        `[YouTube Digest BG] Player details attempt ${attempt + 1}/4 failed:`,
+        message,
+      );
+      if (!/Frame with ID .* was removed|frame.*removed|No tab with id/i.test(message)) {
+        break;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
   }
+  console.warn("[YouTube Digest BG] Player details unavailable after retries.");
+  return null;
 }
 
 // ============================================================
@@ -605,7 +758,11 @@ async function getPlayerVideoDetails(tabId) {
  * @param {string} videoId - The YouTube video ID (e.g., "dQw4w9WgXcQ")
  * @returns {Object} - { success, transcript, transcriptText, language } or { success: false, error }
  */
-async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") {
+async function handleFetchTranscript(
+  videoId,
+  requestedSourceLanguage = "auto",
+  videoMetadata = null,
+) {
   try {
     const settings = await getSettings();
     if (!settings.supadataApiKey) {
@@ -620,6 +777,12 @@ async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") 
       requestedSourceLanguage ?? settings.sourceLanguage,
       settings.sourceLanguage,
     );
+    const detectedSourceLanguage =
+      resolvedSourceLanguage === "auto"
+        ? YTD_SETTINGS.resolveLanguageFromVideoMetadata(videoMetadata)
+        : null;
+    const effectiveSourceLanguage =
+      detectedSourceLanguage || resolvedSourceLanguage;
 
     // Share only the canonical watch URL. This strips playlist, referral,
     // timestamp, and other browsing parameters from the active tab URL.
@@ -628,8 +791,8 @@ async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") 
     const apiUrl = new URL("https://api.supadata.ai/v1/transcript");
     apiUrl.searchParams.set("url", canonicalVideoUrl);
     apiUrl.searchParams.set("text", "false"); // Get timestamped chunks, not plain text
-    if (resolvedSourceLanguage !== "auto") {
-      apiUrl.searchParams.set("lang", resolvedSourceLanguage);
+    if (effectiveSourceLanguage !== "auto") {
+      apiUrl.searchParams.set("lang", effectiveSourceLanguage);
     }
     // Caption-only product scope: never fall back to paid AI transcription.
     apiUrl.searchParams.set("mode", "native");
@@ -657,8 +820,9 @@ async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") 
       };
     }
 
+    const responseData = await response.json();
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
+      const errorData = responseData || {};
       if (response.status === 401) {
         return {
           success: false,
@@ -686,7 +850,7 @@ async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") 
       );
     }
 
-    const data = await response.json();
+    const data = responseData;
 
     // Parse the response into our internal format
     // Supadata returns: { content: [{ text, offset, duration, lang }], lang, availableLangs }
@@ -743,6 +907,9 @@ async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") 
       transcriptTextTimestamped: transcriptTextTimestamped.trim(), // For AI
       language,
       availableLanguages,
+      // Tell the side panel which language Auto actually resolved to so the
+      // auto cache can be validated after tab switches and extension reloads.
+      sourceLanguage: effectiveSourceLanguage,
     };
   } catch (error) {
     console.error("Transcript fetch error:", error);
@@ -898,12 +1065,8 @@ async function handleAnalyzeTranscript(
 ) {
   try {
     const settings = await getSettings();
-    if (!settings.aiApiKey) {
-      return {
-        success: false,
-        error: "NO_AI_KEY",
-        message: "DeepSeek API key not configured. Open YouTube Digest Settings.",
-      };
+    if (!Object.values(settings.providers || {}).some((provider) => provider?.enabled && provider?.apiKey)) {
+      return { success: false, error: "NO_AI_KEY", message: "No AI provider is configured. Open YouTube Digest Settings." };
     }
 
     // Convert duration to MM:SS format for context
@@ -958,6 +1121,7 @@ async function handleAnalyzeTranscript(
 
     debugLog("[YouTube Digest] Requesting video analysis", settings.aiModel);
     const { text: responseText } = await requestAiCompletion({
+      task: "analysis",
       maxTokens: 8192,
       responseFormat: { type: "json_object" },
       messages: [
@@ -1275,7 +1439,7 @@ async function cleanupNoteText(
   videoTitle,
 ) {
   const settings = await getSettings();
-  if (!settings.aiApiKey) {
+  if (!settings.providers?.deepseek?.apiKey && !settings.providers?.gemini?.apiKey && !settings.providers?.openai?.apiKey && !settings.providers?.custom?.apiKey) {
     return [beforeText, targetText, afterText].filter(Boolean).join(" ");
   }
 
@@ -1299,6 +1463,7 @@ async function cleanupNoteText(
       variables,
     );
     const { text: resultText } = await requestAiCompletion({
+      task: "note",
       maxTokens: 512,
       responseFormat: { type: "json_object" },
       messages: [
@@ -1398,12 +1563,8 @@ async function handleExplainSelection(
 ) {
   try {
     const settings = await getSettings();
-    if (!settings.aiApiKey) {
-      return {
-        success: false,
-        error: "NO_AI_KEY",
-        message: "DeepSeek API key not configured.",
-      };
+    if (!settings.providers?.deepseek?.apiKey && !settings.providers?.gemini?.apiKey && !settings.providers?.openai?.apiKey && !settings.providers?.custom?.apiKey) {
+      return { success: false, error: "NO_AI_KEY", message: "No AI provider is configured. Open YouTube Digest Settings." };
     }
 
     const variables = {
@@ -1424,6 +1585,7 @@ async function handleExplainSelection(
 
     debugLog("[YouTube Digest] Requesting selection explanation");
     const { text: explanation } = await requestAiCompletion({
+      task: "explanation",
       maxTokens: 1024,
       messages: [
         { role: "system", content: systemPrompt },
@@ -1445,26 +1607,27 @@ async function handleExplainSelection(
 }
 
 // ============================================================
-// TRANSLATION — Translate transcript batches into Simplified Chinese
+// TRANSLATION — Generic source × target translation
 // ============================================================
-// Uses a low temperature for consistent, natural translations.
 
-/**
- * Shared base rules that every translation prompt includes.
- * These ensure translations sound natural rather than machine-translated.
- *
- * @param {string} targetLanguage - Must be 'zh'
- * @returns {Promise<string>} - The base translation rules
- */
+function normalizeTranslationLanguage(value, fallback = "auto") {
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!raw) return fallback;
+  return YTD_SETTINGS.normalizeTargetLanguage(raw) || fallback;
+}
+
 async function getTranslationBaseRules(targetLanguage) {
-  if (targetLanguage !== "zh") {
-    throw new Error(`Unsupported translation target: ${targetLanguage}`);
+  const langName = targetLanguage === "zh-CN" || targetLanguage === "zh"
+    ? "Simplified Chinese"
+    : targetLanguage;
+  let langSpecific = "";
+  if (langName === "Simplified Chinese") {
+    try {
+      langSpecific = await loadPromptSection("translation.md", "Simplified Chinese rules");
+    } catch (_error) {
+      langSpecific = "";
+    }
   }
-  const langName = "Simplified Chinese";
-  const langSpecific = await loadPromptSection(
-    "translation.md",
-    "Chinese rules",
-  );
   return loadPromptSection("translation.md", "Shared base rules", {
     langName,
     langSpecific,
@@ -1504,11 +1667,20 @@ function looksLikeChineseTranslation(text, sourceText) {
   return /[\u3400-\u9fff]/.test(text);
 }
 
+function isPlausibleTargetTranslation(text, sourceText, targetLanguage) {
+  if (!text) return false;
+  if (targetLanguage === "zh-CN" || targetLanguage === "zh") {
+    return looksLikeChineseTranslation(text, sourceText);
+  }
+  return true;
+}
+
 /**
- * Aligns untrusted model output by exact stable ID. Missing, duplicated,
- * unknown, empty, or clearly non-Chinese values become explicit row errors.
+ * Aligns untrusted model output by exact stable ID. Language-agnostic except
+ * for the legacy Chinese sanity check, which remains enabled only for Chinese
+ * targets so old behavior stays safe while other target languages are open.
  */
-function normalizeTranslatedSegmentBatch(parsed, sourceSegments) {
+function normalizeTranslatedSegmentBatch(parsed, sourceSegments, targetLanguage = "zh-CN") {
   const candidates = Array.isArray(parsed?.segments) ? parsed.segments : [];
   const sourceById = new Map(sourceSegments.map((segment) => [segment.id, segment]));
   const translatedById = new Map();
@@ -1522,9 +1694,9 @@ function normalizeTranslatedSegmentBatch(parsed, sourceSegments) {
     ) {
       return;
     }
-    const text = candidate.text.trim();
     const source = sourceById.get(candidate.id);
-    if (text && looksLikeChineseTranslation(text, source.text)) {
+    const text = candidate.text.trim();
+    if (source && isPlausibleTargetTranslation(text, source.text, targetLanguage)) {
       translatedById.set(candidate.id, text);
     }
   });
@@ -1533,34 +1705,23 @@ function normalizeTranslatedSegmentBatch(parsed, sourceSegments) {
     segments: sourceSegments.map((source) => ({
       id: source.id,
       text: translatedById.get(source.id) || "",
-      error: translatedById.has(source.id)
-        ? ""
-        : "Missing or invalid Chinese translation",
+      error: translatedById.has(source.id) ? "" : "Missing or invalid translation",
     })),
   };
 }
 
 /**
- * Translates content using DeepSeek.
- * @param {Object} content - JSON object containing semantic transcript segments
- * @param {string} contentType - Must be 'transcriptBatch'
- * @param {string} targetLanguage - 'zh' for Simplified Chinese
- * @param {string} videoTitle - The video title (for context)
- * @returns {Object} - { success, translatedContent } or { success: false, error }
+ * Translates transcript batches from the detected/source language into any
+ * user-selected target language.
  */
 async function handleTranslateContent(
   content,
   contentType,
   targetLanguage,
   videoTitle,
+  sourceLanguage = "auto",
 ) {
   try {
-    if (targetLanguage !== "zh") {
-      return {
-        success: false,
-        error: `Unsupported translation target: ${String(targetLanguage)}`,
-      };
-    }
     if (contentType !== "transcriptBatch") {
       return {
         success: false,
@@ -1568,19 +1729,27 @@ async function handleTranslateContent(
       };
     }
 
+    const normalizedTargetLanguage = normalizeTranslationLanguage(targetLanguage, "");
+    if (!normalizedTargetLanguage) {
+      return { success: false, error: "A valid target language is required" };
+    }
+    const normalizedSourceLanguage = normalizeTranslationLanguage(sourceLanguage, "auto");
+
     const settings = await getSettings();
-    if (!settings.aiApiKey) {
-      return { success: false, error: "DeepSeek API key not configured" };
+    if (!Object.values(settings.providers || {}).some((provider) => provider?.enabled && provider?.apiKey)) {
+      return { success: false, error: "No AI provider is configured" };
     }
 
     const sourceSegments = validateTranscriptBatchRequest(content);
-    const langName = "Simplified Chinese";
-    const baseRules = await getTranslationBaseRules(targetLanguage);
+    const langName = normalizedTargetLanguage === "zh-CN" ? "Simplified Chinese" : normalizedTargetLanguage;
+    const baseRules = await getTranslationBaseRules(normalizedTargetLanguage);
     const systemPrompt = await loadPromptSection(
       "translation.md",
       "Transcript batch translation",
       {
         langName,
+        sourceLanguage: normalizedSourceLanguage,
+        targetLanguage: normalizedTargetLanguage,
         videoTitle: videoTitle || "Unknown",
         baseRules,
       },
@@ -1597,8 +1766,6 @@ async function handleTranslateContent(
       translationOptions,
     );
 
-    // DeepSeek JSON mode can rarely return an empty content string. The prompt
-    // already requires JSON, so retry once without response_format.
     if (!result.success && result.code === "EMPTY_AI_RESPONSE") {
       result = await callAiTranslation(systemPrompt, userContent, {
         temperature: translationOptions.temperature,
@@ -1608,11 +1775,11 @@ async function handleTranslateContent(
     if (!result.success) return result;
 
     const parsed = parseLooseJson(result.text);
-    const aligned = normalizeTranslatedSegmentBatch(parsed, sourceSegments);
+    const aligned = normalizeTranslatedSegmentBatch(parsed, sourceSegments, normalizedTargetLanguage);
     if (!aligned.segments.some((segment) => segment.text)) {
       return {
         success: false,
-        error: "Translation returned no valid Chinese segments",
+        error: `Translation returned no valid ${langName} segments`,
       };
     }
     return { success: true, translatedContent: aligned };
@@ -1637,6 +1804,7 @@ async function callAiTranslation(
 ) {
   try {
     const { text } = await requestAiCompletion({
+      task: "translation",
       temperature,
       maxTokens,
       responseFormat,
@@ -1659,12 +1827,33 @@ async function callAiTranslation(
   }
 }
 
+async function testAiProvider(modelId, draftSettings = null) {
+  try {
+    const { text, model } = await requestAiCompletion({
+      modelId,
+      settingsOverride: draftSettings,
+      task: "analysis",
+      maxTokens: 32,
+      temperature: 0,
+      messages: [
+        { role: "system", content: "Reply with exactly: OK" },
+        { role: "user", content: "Connection test. Reply with exactly: OK" },
+      ],
+    });
+    return { success: true, provider: model.providerId, model: model.model, text: text.trim() };
+  } catch (error) {
+    return { success: false, error: error.message, code: error.code, status: error.status };
+  }
+}
+
 // Pure validators are exposed for the repository's Node tests only.
 globalThis.__YTD_TRANSLATION_TESTING__ = {
   requestAiCompletion,
   callAiTranslation,
   validateTranscriptBatchRequest,
   normalizeTranslatedSegmentBatch,
+  looksLikeChineseTranslation,
   handleTranslateContent,
   handleFetchTranscript,
+  detectPlayerVideoLanguage,
 };

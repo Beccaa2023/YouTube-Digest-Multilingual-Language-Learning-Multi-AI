@@ -122,6 +122,23 @@ function loadBackgroundHelpers({
         }
         return `https://www.youtube.com/watch?v=${normalized}`;
       },
+      resolveLanguageFromVideoMetadata: (metadata) => {
+        if (!metadata || typeof metadata !== "object") return null;
+        const raw = String(metadata.defaultAudioLanguage || metadata.audioLanguage || "").trim();
+        if (!raw) return null;
+        const normalized = raw.replace(/_/g, "-");
+        try {
+          const locale = new Intl.Locale(normalized);
+          const language = locale.language;
+          if (!language) return null;
+          if (language === "zh" && locale.script) {
+            return `${language}-${locale.script}`;
+          }
+          return language;
+        } catch (_error) {
+          return normalized.split("-")[0] || null;
+        }
+      },
     },
   };
   sandbox.globalThis = sandbox;
@@ -408,6 +425,187 @@ test("fetchTranscript respects auto and explicit source language settings and pr
   assert.equal(explicitUrl.searchParams.get("lang"), "pt");
   assert.equal(explicitUrl.searchParams.get("mode"), "native");
   assert.equal(explicitUrl.searchParams.get("text"), "false");
+});
+
+test("auto-detect uses YouTube metadata defaultAudioLanguage when available", async () => {
+  const captured = [];
+  const helpers = loadBackgroundHelpers({
+    settings: {
+      provider: "deepseek",
+      aiApiKey: "test-key",
+      aiBaseUrl: "https://api.deepseek.com",
+      aiModel: "deepseek-v4-flash",
+      supadataApiKey: "supadata-key",
+      sourceLanguage: "auto",
+    },
+    fetchImpl: async (url) => {
+      captured.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ text: "Olá mundo", offset: 0, duration: 1000, lang: "pt" }],
+          lang: "pt",
+          availableLangs: ["pt", "en"],
+        }),
+      };
+    },
+  });
+
+  const result = await helpers.handleFetchTranscript(
+    "abc123",
+    "auto",
+    { defaultAudioLanguage: "pt-PT" },
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.language, "pt");
+  assert.deepEqual(Array.from(result.availableLanguages), ["pt", "en"]);
+  const apiUrl = new URL(captured[0]);
+  assert.equal(apiUrl.searchParams.get("lang"), "pt");
+});
+
+test("auto-detect resolves en-US metadata to lang=en", async () => {
+  const captured = [];
+  const helpers = loadBackgroundHelpers({
+    settings: {
+      provider: "deepseek",
+      aiApiKey: "test-key",
+      aiBaseUrl: "https://api.deepseek.com",
+      aiModel: "deepseek-v4-flash",
+      supadataApiKey: "supadata-key",
+      sourceLanguage: "auto",
+    },
+    fetchImpl: async (url) => {
+      captured.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ text: "Hello world", offset: 0, duration: 1000, lang: "en" }],
+          lang: "en",
+          availableLangs: ["en", "pt"],
+        }),
+      };
+    },
+  });
+
+  const result = await helpers.handleFetchTranscript(
+    "abc123",
+    "auto",
+    { defaultAudioLanguage: "en-US" },
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.language, "en");
+  assert.deepEqual(Array.from(result.availableLanguages), ["en", "pt"]);
+  const apiUrl = new URL(captured[0]);
+  assert.equal(apiUrl.searchParams.get("lang"), "en");
+});
+
+test("auto-detect uses pt-PT metadata to request lang=pt", async () => {
+  const captured = [];
+  const helpers = loadBackgroundHelpers({
+    settings: {
+      provider: "deepseek",
+      aiApiKey: "test-key",
+      aiBaseUrl: "https://api.deepseek.com",
+      aiModel: "deepseek-v4-flash",
+      supadataApiKey: "supadata-key",
+      sourceLanguage: "auto",
+    },
+    fetchImpl: async (url) => {
+      captured.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ text: "Olá mundo", offset: 0, duration: 1000, lang: "pt" }],
+          lang: "pt",
+          availableLangs: ["pt", "en"],
+        }),
+      };
+    },
+  });
+
+  const result = await helpers.handleFetchTranscript(
+    "abc123",
+    "auto",
+    { defaultAudioLanguage: "pt-PT" },
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.language, "pt");
+  assert.deepEqual(Array.from(result.availableLanguages), ["pt", "en"]);
+  const apiUrl = new URL(captured[0]);
+  assert.equal(apiUrl.searchParams.get("lang"), "pt");
+});
+
+test("explicit sourceLanguage override is not replaced by metadata", async () => {
+  const captured = [];
+  const helpers = loadBackgroundHelpers({
+    settings: {
+      provider: "deepseek",
+      aiApiKey: "test-key",
+      aiBaseUrl: "https://api.deepseek.com",
+      aiModel: "deepseek-v4-flash",
+      supadataApiKey: "supadata-key",
+      sourceLanguage: "auto",
+    },
+    fetchImpl: async (url) => {
+      captured.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ text: "Hello world", offset: 0, duration: 1000, lang: "en" }],
+          lang: "en",
+          availableLangs: ["en", "pt"],
+        }),
+      };
+    },
+  });
+
+  const result = await helpers.handleFetchTranscript(
+    "abc123",
+    "en",
+    { defaultAudioLanguage: "pt-PT" },
+  );
+
+  assert.equal(result.success, true);
+  const apiUrl = new URL(captured[0]);
+  assert.equal(apiUrl.searchParams.get("lang"), "en");
+});
+
+test("auto-detect falls back when YouTube metadata is unavailable", async () => {
+  const captured = [];
+  const helpers = loadBackgroundHelpers({
+    settings: {
+      provider: "deepseek",
+      aiApiKey: "test-key",
+      aiBaseUrl: "https://api.deepseek.com",
+      aiModel: "deepseek-v4-flash",
+      supadataApiKey: "supadata-key",
+      sourceLanguage: "auto",
+    },
+    fetchImpl: async (url) => {
+      captured.push(String(url));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          content: [{ text: "Olá mundo", offset: 0, duration: 1000, lang: "pt" }],
+          lang: "pt",
+          availableLangs: ["pt", "en"],
+        }),
+      };
+    },
+  });
+
+  const result = await helpers.handleFetchTranscript("abc123", "auto", null);
+  assert.equal(result.success, true);
+  const apiUrl = new URL(captured[0]);
+  assert.equal(apiUrl.searchParams.get("lang"), null);
 });
 
 test("transcript cache keys separate languages and legacy cache key still loads", async () => {

@@ -5,7 +5,7 @@
 Turn every YouTube video into a resource for deep learning. YouTube Digest brings transcripts, bilingual translation, AI overviews, explanations, and timestamped notes into one Chrome side panel, so you can study ideas and language without losing your place.
 
 - Turn captions into a readable, searchable learning resource.
-- Learn languages with the original transcript, a Simplified Chinese translation, or an aligned bilingual view.
+- Learn languages with any detected source language and one or more user-selected target languages, with Original, Translation, and Bilingual views.
 - Build understanding with an AI overview, chapters, key quotes, and selected-text explanations.
 - Navigate long videos by clicking timestamps in the transcript, overview, or notes.
 - Save polished timestamped notes for later study.
@@ -76,7 +76,7 @@ See the [official DeepSeek API documentation](https://api-docs.deepseek.com/) fo
 
 Open **Settings** from the side panel. You can also open the YouTube Digest **Options** page from its card at `chrome://extensions` or by right-clicking its toolbar icon. Paste keys only into these Settings fields. Never paste a key into an AI chat, repository file, screenshot, or public message.
 
-The published version supports DeepSeek V4 Flash as its only AI provider:
+Version 1.2.0 supports multiple AI providers through a common OpenAI-compatible chat layer. DeepSeek V4 Flash remains the default. Google Gemini and OpenAI are optional, and a custom OpenAI-compatible endpoint can be configured.
 
 ```text
 Base URL: https://api.deepseek.com
@@ -100,8 +100,9 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 
 - Google Chrome 116 or newer, using the Side Panel API.
 - Standard `youtube.com/watch` video pages.
-- Native subtitle tracks returned by Supadata. YouTube Digest prefers English when available, but may show another native language.
-- Original, Simplified Chinese, and aligned bilingual transcript views.
+- Native subtitle tracks returned by Supadata. Auto mode detects the video language from YouTube metadata when available and otherwise uses Supadata caption metadata.
+- Any preferred target languages configured by the user, with one default target used to initialize each new video.
+- Original, Translation, and aligned Bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
 - Local notes and a local cache for recent transcript and digest results.
 - DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
@@ -146,7 +147,7 @@ This is a personal remix project. Upstream issues and pull requests are not acce
 
 YouTube Digest uses plain HTML, CSS, and JavaScript with no build step, so it is a friendly starting point for agent-assisted projects. Ideas to try:
 
-- Add more translation languages and let each person choose a learning language.
+- Continue expanding multilingual learning features while keeping source and target languages independent.
 - Create customized summary templates for lectures, interviews, tutorials, reviews, or research talks.
 - Build a vocabulary notebook that saves a word, its sentence, meaning, and video timestamp.
 - Export notes and vocabulary to Markdown, CSV, Anki, or another study tool.
@@ -224,3 +225,13 @@ The agent should also reload the unpacked extension in Chrome and test several r
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Version 1.2.0 — multi-provider AI
+
+- DeepSeek remains the default provider and is fully backward compatible with v1.1.x settings.
+- Added Google Gemini through Google's OpenAI-compatible endpoint.
+- Added OpenAI through Chat Completions.
+- Added a custom OpenAI-compatible provider with HTTPS origin permission requested by Chrome when needed.
+- Added separate model defaults for translation, explanation, overview/analysis, and note polishing.
+- Added connection-test buttons in Settings.
+- API keys remain in Chrome local extension storage; transcript content is sent only to the provider selected for the task.
