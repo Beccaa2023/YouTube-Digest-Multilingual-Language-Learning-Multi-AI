@@ -12,10 +12,22 @@ var YTD_SETTINGS = (() => {
     aiBaseUrl: "https://api.deepseek.com",
     aiModel: "deepseek-v4-flash",
     supadataApiKey: "",
+    sourceLanguage: "auto",
   });
 
   function isLegacyCustom(input) {
     return !!input && input.provider === "custom";
+  }
+
+  function normalizeSourceLanguage(value) {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw || raw === "auto") return "auto";
+    const normalized = raw.replace(/_/g, "-");
+    try {
+      return new Intl.Locale(normalized).toString();
+    } catch (_error) {
+      return normalized;
+    }
   }
 
   function normalize(input = {}) {
@@ -32,6 +44,7 @@ var YTD_SETTINGS = (() => {
         typeof input.supadataApiKey === "string"
           ? input.supadataApiKey.trim()
           : "",
+      sourceLanguage: normalizeSourceLanguage(input.sourceLanguage),
     };
   }
 
@@ -59,6 +72,7 @@ var YTD_SETTINGS = (() => {
     DEFAULTS,
     isLegacyCustom,
     normalize,
+    normalizeSourceLanguage,
     migrateLegacyCustom,
     chatCompletionsUrl,
     canonicalYouTubeUrl,

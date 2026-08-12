@@ -61,3 +61,11 @@ test("Supadata receives a canonical YouTube URL", () => {
     /Invalid YouTube video ID/,
   );
 });
+test("sourceLanguage defaults to auto and accepts explicit BCP-47 values", () => {
+  assert.equal(settings.normalize({}).sourceLanguage, "auto");
+  assert.equal(settings.normalize({ sourceLanguage: " pt " }).sourceLanguage, "pt");
+  assert.equal(
+    settings.normalize({ sourceLanguage: "zh-Hant-TW" }).sourceLanguage,
+    "zh-Hant-TW",
+  );
+});

@@ -36,6 +36,22 @@ async function getSettings() {
   return YTD_SETTINGS.normalize(stored[YTD_SETTINGS.STORAGE_KEY]);
 }
 
+function normalizeTranscriptSourceLanguage(language, fallback = "auto") {
+  const sourceLanguage = language ?? fallback;
+  return YTD_SETTINGS.normalize({ sourceLanguage }).sourceLanguage;
+}
+
+function normalizeLanguageList(values) {
+  if (!Array.isArray(values)) return [];
+  const unique = new Set();
+  for (const value of values) {
+    const normalized = String(value ?? "").trim();
+    if (!normalized) continue;
+    unique.add(normalized);
+  }
+  return [...unique];
+}
+
 const promptFileCache = new Map();
 
 async function loadPromptSection(fileName, heading, variables = {}) {
@@ -302,7 +318,7 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // We need to return true to indicate we'll respond asynchronously
   if (message.action === "fetchTranscript") {
-    handleFetchTranscript(message.videoId)
+    handleFetchTranscript(message.videoId, message.sourceLanguage)
       .then(sendResponse)
       .catch((err) => sendResponse({ error: err.message }));
     return true; // Keep the message channel open for async response
@@ -589,7 +605,7 @@ async function getPlayerVideoDetails(tabId) {
  * @param {string} videoId - The YouTube video ID (e.g., "dQw4w9WgXcQ")
  * @returns {Object} - { success, transcript, transcriptText, language } or { success: false, error }
  */
-async function handleFetchTranscript(videoId) {
+async function handleFetchTranscript(videoId, requestedSourceLanguage = "auto") {
   try {
     const settings = await getSettings();
     if (!settings.supadataApiKey) {
@@ -600,6 +616,11 @@ async function handleFetchTranscript(videoId) {
       };
     }
 
+    const resolvedSourceLanguage = normalizeTranscriptSourceLanguage(
+      requestedSourceLanguage ?? settings.sourceLanguage,
+      settings.sourceLanguage,
+    );
+
     // Share only the canonical watch URL. This strips playlist, referral,
     // timestamp, and other browsing parameters from the active tab URL.
     const canonicalVideoUrl = YTD_SETTINGS.canonicalYouTubeUrl(videoId);
@@ -607,7 +628,9 @@ async function handleFetchTranscript(videoId) {
     const apiUrl = new URL("https://api.supadata.ai/v1/transcript");
     apiUrl.searchParams.set("url", canonicalVideoUrl);
     apiUrl.searchParams.set("text", "false"); // Get timestamped chunks, not plain text
-    apiUrl.searchParams.set("lang", "en"); // Prefer English
+    if (resolvedSourceLanguage !== "auto") {
+      apiUrl.searchParams.set("lang", resolvedSourceLanguage);
+    }
     // Caption-only product scope: never fall back to paid AI transcription.
     apiUrl.searchParams.set("mode", "native");
 
@@ -710,12 +733,16 @@ async function handleFetchTranscript(videoId) {
       };
     }
 
+    const language = typeof data.lang === "string" ? data.lang : null;
+    const availableLanguages = normalizeLanguageList(data.availableLangs);
+
     return {
       success: true,
       transcript: transcript,
       transcriptText: transcriptTextPlain.trim(), // For display
       transcriptTextTimestamped: transcriptTextTimestamped.trim(), // For AI
-      language: typeof data.lang === "string" ? data.lang : null,
+      language,
+      availableLanguages,
     };
   } catch (error) {
     console.error("Transcript fetch error:", error);
@@ -784,12 +811,16 @@ async function pollTranscriptJob(jobId, supadataApiKey) {
         }
       }
 
+      const language = typeof data.lang === "string" ? data.lang : null;
+      const availableLanguages = normalizeLanguageList(data.availableLangs);
+
       return {
         success: true,
         transcript: transcript,
         transcriptText: transcriptTextPlain.trim(),
         transcriptTextTimestamped: transcriptTextTimestamped.trim(),
-        language: typeof data.lang === "string" ? data.lang : null,
+        language,
+        availableLanguages,
       };
     }
 
@@ -1635,4 +1666,5 @@ globalThis.__YTD_TRANSLATION_TESTING__ = {
   validateTranscriptBatchRequest,
   normalizeTranslatedSegmentBatch,
   handleTranslateContent,
+  handleFetchTranscript,
 };
