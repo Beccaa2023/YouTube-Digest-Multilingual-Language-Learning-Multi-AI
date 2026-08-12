@@ -1,5 +1,5 @@
 # YouTube Digest — 多语言与多 AI
-
+[English](https://github.com/Beccaa2023/YouTube-Digest-Multilingual-Language-Learning-Multi-AI/edit/main/README.md) | [简体中文](https://github.com/Beccaa2023/YouTube-Digest-Multilingual-Language-Learning-Multi-AI/edit/main/README.zh-CN.md)
 一个用于将 YouTube 视频转换为多语言学习与阅读资源的 Chrome 扩展。
 
 YouTube Digest 提供字幕获取、翻译、双语阅读、AI 视频分析以及带时间戳的笔记功能。支持多种源语言、目标语言以及多个 AI 服务商。
