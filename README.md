@@ -1,5 +1,6 @@
 # YouTube Digest — Multilingual & Multi-AI
-[English](https://github.com/Beccaa2023/YouTube-Digest-Multilingual-Language-Learning-Multi-AI/edit/main/README.md) | 简体中文
+[English](https://github.com/Beccaa2023/YouTube-Digest-Multilingual-Language-Learning-Multi-AI/edit/main/README.md) | [简体中文](https://github.com/Beccaa2023/YouTube-Digest-Multilingual-Language-Learning-Multi-AI/edit/main/README.zh-CN.md)
+
 A Chrome extension for turning YouTube videos into multilingual learning and reading resources.
 
 YouTube Digest provides transcript retrieval, translation, bilingual reading, AI-powered video analysis, and timestamped notes. It supports multiple source and target languages and multiple AI providers.
