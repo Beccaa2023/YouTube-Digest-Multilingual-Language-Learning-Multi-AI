@@ -6,6 +6,7 @@ const vm = require("node:vm");
 
 const root = path.resolve(__dirname, "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
+const settingsModule = require("../settings.js");
 
 function loadSidepanelHelpers({
   sendMessage = () => Promise.resolve({}),
@@ -111,35 +112,7 @@ function loadBackgroundHelpers({
       },
       tabs: { onUpdated: listeners, onActivated: listeners },
     },
-    YTD_SETTINGS: {
-      STORAGE_KEY: "ytd_settings",
-      normalize: (value) => value,
-      chatCompletionsUrl: (baseUrl) => `${baseUrl}/chat/completions`,
-      canonicalYouTubeUrl: (videoId) => {
-        const normalized = String(videoId || "").trim();
-        if (!/^[A-Za-z0-9_-]{6,20}$/.test(normalized)) {
-          throw new Error("Invalid YouTube video ID.");
-        }
-        return `https://www.youtube.com/watch?v=${normalized}`;
-      },
-      resolveLanguageFromVideoMetadata: (metadata) => {
-        if (!metadata || typeof metadata !== "object") return null;
-        const raw = String(metadata.defaultAudioLanguage || metadata.audioLanguage || "").trim();
-        if (!raw) return null;
-        const normalized = raw.replace(/_/g, "-");
-        try {
-          const locale = new Intl.Locale(normalized);
-          const language = locale.language;
-          if (!language) return null;
-          if (language === "zh" && locale.script) {
-            return `${language}-${locale.script}`;
-          }
-          return language;
-        } catch (_error) {
-          return normalized.split("-")[0] || null;
-        }
-      },
-    },
+    YTD_SETTINGS: settingsModule,
   };
   sandbox.globalThis = sandbox;
   vm.runInNewContext(read("background.js"), sandbox);
@@ -200,12 +173,14 @@ function streamingResponse(chunks, { ok = true, status = 200 } = {}) {
 const encode = (value) => new TextEncoder().encode(value);
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
-test("Transcript header exposes and wires Original, Chinese, and bilingual modes", () => {
+test("Transcript header exposes source and target selectors plus three display modes", () => {
   const html = read("sidepanel.html");
   const js = read("sidepanel.js");
   assert.match(html, /data-transcript-mode="original"[\s\S]*?>Original</);
-  assert.match(html, /data-transcript-mode="zh"[\s\S]*?>\u4e2d\u6587</);
-  assert.match(html, /data-transcript-mode="bilingual"[\s\S]*?>\u53cc\u8bed</);
+  assert.match(html, /id="sourceLanguageSelect"/);
+  assert.match(html, /id="targetLanguageSelect"/);
+  assert.match(html, /data-transcript-mode="translation"[\s\S]*?>Translation</);
+  assert.match(html, /data-transcript-mode="bilingual"[\s\S]*?>Bilingual</);
   assert.match(js, /handleTranscriptModeChange\(button\.dataset\.transcriptMode\)/);
   assert.match(js, /contentType: "transcriptBatch"/);
   assert.doesNotMatch(js, /English \+ Chinese/);
@@ -347,7 +322,7 @@ test("subtitle markup renderer keeps attributed and arbitrary HTML escaped", () 
 test("background rejects unsupported language fallthrough and malformed batches", () => {
   const source = read("background.js");
   const { validateTranscriptBatchRequest } = loadBackgroundHelpers();
-  assert.match(source, /targetLanguage !== "zh"/);
+  assert.match(source, /normalizeTargetLanguage/);
   assert.throws(
     () => validateTranscriptBatchRequest({ segments: [] }),
     /1 to 4 segments/,
@@ -651,7 +626,7 @@ test("all AI product requests use DeepSeek non-thinking and JSON behavior", asyn
   const backgroundSource = read("background.js");
   assert.equal(
     (backgroundSource.match(/await requestAiCompletion\(\{/g) || []).length,
-    4,
+    5,
   );
   assert.doesNotMatch(backgroundSource, /disableThinking/);
   for (const callPath of [
@@ -891,8 +866,8 @@ test("translation message watchdog rejects, clears its timer, and ignores late r
 
 test("Chinese prompt preserves natural bilingual-learning style rules", () => {
   const prompt = read("prompts/translation.md");
-  assert.match(prompt, /Translate the complete thought/);
-  assert.match(prompt, /Use 你, never 您/);
+  assert.match(prompt, /complete spoken thought/);
+  assert.match(prompt, /Use 你 rather than 您/);
   assert.match(prompt, /spaces between Chinese and adjacent English words or digits/);
-  assert.match(prompt, /source-language `text`/);
+  assert.match(prompt, /\{sourceLanguage\}/);
 });
